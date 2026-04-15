@@ -6,14 +6,9 @@ class CMRM(nn.Module):
     """
     Cross-Modal Refinement Module with Gated Residual.
 
-    梯度路徑設計（解耦）：
-      - slot_loss  ← cache["slots"] = ungated slots
-                     訓練 cross-attention 學出好的 slot 表示
-                     (LR slot ↔ HR slot 的 L1，與 gate 無關，避免 loss=0 死鎖)
-      - feat_loss  ← cache["feat"] = x_refined.mean()
-                     = (x32 + gate * slots.mean()).mean()
-                     訓練 gate (alpha)「要不要打開」
-      - reg_loss   ← 只訓練 LoRA
+    現在主要提供跨幀融合後的 plate-level visual features：
+      - cache["feat"] 會被上層拿去做 multi-view consistency loss
+      - reg_loss 則由語言模型直接做 LR 文字重建
 
     初始化保證：
       alpha=0 → gate=tanh(0)=0 → g=0 → x_refined=x32（LM 完全不受影響）
@@ -51,8 +46,6 @@ class CMRM(nn.Module):
             value=x_normed,
         )
 
-        # ungated slots：cross-attention 的真實輸出
-        # slot_loss 用這個訓練 cross-attn，不依賴 gate 所以不會消失
         slots = slots + slots_out                          # (B, K, dim)
 
         gate = torch.tanh(self.alpha)
@@ -62,7 +55,5 @@ class CMRM(nn.Module):
         x_refined = x_refined.to(orig_dtype)
 
         if return_slots:
-            # 回傳 ungated slots → slot_loss 的梯度訓練 cross-attn
-            # feat_loss 透過 x_refined → gate 路徑訓練 alpha
             return x_refined, attn_weights, slots
         return x_refined, attn_weights

@@ -13,16 +13,16 @@ from peft import PeftModel
 from model.training_components.cross_modal_refinement import CMRM
 from model.training_components.visual_forward_patch import new_visual_forward
 from model.training_components.plate_metrics import extract_plate, plate_score, vote_plate
-from model.training_components.training_losses import cmrm_losses
+from model.training_components.training_losses import multi_view_consistency_loss
 from model.training_components.plate_track_dataset import build_track_dataset, split_track_dataset, build_dataloader
 
 class LPLLM:
     def __init__(self, model_path, num_slots=7, cmrm_dim=1152, num_heads=8, use_cmrm=True, lora_path=None, train_LoRA=False, train_cmrm=False):
-        self.path = model_path
+        self.path = str(model_path)
         self.processor = AutoProcessor.from_pretrained(self.path)
 
         model, self.tokenizer = FastVisionModel.from_pretrained(
-            model_name=model_path,
+            model_name=self.path,
             max_seq_length=2048,
             dtype=None,
             load_in_4bit=True,
@@ -121,7 +121,7 @@ class LPLLM:
     # LoRA
     # -----------------------------------------------------
     def load_lora_adapter(self, lora_path):
-        self.model = PeftModel.from_pretrained(self.model, lora_path)
+        self.model = PeftModel.from_pretrained(self.model, str(lora_path))
         self.device = next(self.model.parameters()).device
         print(f"LoRA loaded from: {lora_path}")
 
@@ -170,52 +170,13 @@ class LPLLM:
             for k, v in inputs.items()
         }
 
-    def _build_hr_inputs(self, hr_images_flat):
-        hr_messages = [
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "只輸出車牌，禁止其他文字。如'ABC1234'，但'您的答案是ABC1234'則是非法回答。車牌會是7個字的英文字母及數字排列組合"},
-                    ],
-                }
-            ]
-            for _ in hr_images_flat
-        ]
-
-        hr_texts = [
-            self.processor.apply_chat_template(
-                msg,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            for msg in hr_messages
-        ]
-
-        hr_inputs = self.processor(
-            text=hr_texts,
-            images=hr_images_flat,
-            padding=True,
-            return_tensors="pt",
-        )
-        return self._move_to_device(hr_inputs)
-
     def _set_num_views(self, num_views: int):
         """在每次 forward 前告訴 patches.py 每張車牌有幾幀，讓 CMRM 跨幀 attend。"""
         if self.use_cmrm:
             self._get_visual_module()._num_views_per_plate = num_views
 
-    def _forward_and_get_cache(self, model_inputs, batch_size, num_views):
-        self._set_num_views(num_views)
-        _ = self.model(**model_inputs)
-        cache = self._get_visual_cache()
-        slots = self._reshape_track(cache["slots"], batch_size, num_views)
-        feat = self._reshape_track(cache["feat"], batch_size, num_views)
-        return slots, feat
 
-
-    def train_step(self, batch, lambda_reg=1, lambda_slot=0.1, lambda_feat=1.0):
+    def train_step(self, batch, lambda_reg=1.0, lambda_mvc=0.1):
         batch_size = len(batch["plate_ids"])
         num_views = batch["num_views"][0]
         if any(v != num_views for v in batch["num_views"]):
@@ -231,63 +192,30 @@ class LPLLM:
             total_loss = reg_loss
             loss_dict = {
                 "reg": float(reg_loss.detach().item()),
-                "slot": 0.0,
-                "feat": 0.0,
+                "mvc": 0.0,
                 "total": float(total_loss.detach().item()),
             }
             return total_loss, loss_dict
 
-        # ===== CMRM branch =====
+        # ===== CMRM + multi-view consistency branch =====
         lr_cache = self._get_visual_cache()
-        lr_slots = self._reshape_track(lr_cache["slots"], batch_size, num_views)
         lr_feat = self._reshape_track(lr_cache["feat"], batch_size, num_views)
+        mvc_loss = multi_view_consistency_loss(lr_feat)
 
-        with torch.no_grad():
-            hr_inputs = self._build_hr_inputs(batch["hr_images_flat"])
-            hr_slots, hr_feat = self._forward_and_get_cache(hr_inputs, batch_size, num_views)
-
-        print(
-            f"[cache] lr_slots mean={lr_slots.abs().mean().item():.4f} max={lr_slots.abs().max().item():.4f} | "
-            f"lr_feat mean={lr_feat.abs().mean().item():.4f} max={lr_feat.abs().max().item():.4f} | "
-            f"hr_slots mean={hr_slots.abs().mean().item():.4f} max={hr_slots.abs().max().item():.4f} | "
-            f"hr_feat mean={hr_feat.abs().mean().item():.4f} max={hr_feat.abs().max().item():.4f} /n"
-        )
-
-        slot_loss, feat_loss = cmrm_losses(
-            lr_slots=lr_slots,
-            lr_feat=lr_feat,
-            hr_slots=hr_slots,
-            hr_feat=hr_feat,
-        )
-        
         if torch.isnan(reg_loss) or torch.isinf(reg_loss):
             raise RuntimeError(f"reg_loss invalid: {reg_loss}")
 
-        if torch.isnan(slot_loss) or torch.isinf(slot_loss):
-            raise RuntimeError(f"slot_loss invalid: {slot_loss}")
-
-        if torch.isnan(feat_loss) or torch.isinf(feat_loss):
-            raise RuntimeError(f"feat_loss invalid: {feat_loss}")
-
-        if torch.isnan(lr_slots).any() or torch.isinf(lr_slots).any():
-            raise RuntimeError("lr_slots contains NaN/Inf")
+        if torch.isnan(mvc_loss) or torch.isinf(mvc_loss):
+            raise RuntimeError(f"mvc_loss invalid: {mvc_loss}")
 
         if torch.isnan(lr_feat).any() or torch.isinf(lr_feat).any():
             raise RuntimeError("lr_feat contains NaN/Inf")
 
-        if torch.isnan(hr_slots).any() or torch.isinf(hr_slots).any():
-            raise RuntimeError("hr_slots contains NaN/Inf")
-
-        if torch.isnan(hr_feat).any() or torch.isinf(hr_feat).any():
-            raise RuntimeError("hr_feat contains NaN/Inf")
-        
-
-        total_loss = lambda_reg * reg_loss + lambda_slot * slot_loss + lambda_feat * feat_loss
+        total_loss = lambda_reg * reg_loss + lambda_mvc * mvc_loss
 
         loss_dict = {
             "reg": float(reg_loss.detach().item()),
-            "slot": float(slot_loss.detach().item()),
-            "feat": float(feat_loss.detach().item()),
+            "mvc": float(mvc_loss.detach().item()),
             "total": float(total_loss.detach().item()),
         }
         return total_loss, loss_dict
@@ -419,27 +347,25 @@ class LPLLM:
     # -----------------------------------------------------
     
     @torch.no_grad()
-    def val_step(self, batch, lambda_reg=1.0, lambda_slot=0.1, lambda_feat=1.0):
+    def val_step(self, batch, lambda_reg=1.0, lambda_mvc=0.1):
         self.model.eval()
 
         total_loss, loss_dict = self.train_step(
             batch,
             lambda_reg=lambda_reg,
-            lambda_slot=lambda_slot,
-            lambda_feat=lambda_feat,
+            lambda_mvc=lambda_mvc,
         )
 
         return total_loss.detach().item(), loss_dict
     
     @torch.no_grad()
-    def validate(self, val_loader, lambda_reg=1.0, lambda_slot=0.1, lambda_feat=1.0, max_batches=None):
+    def validate(self, val_loader, lambda_reg=1.0, lambda_mvc=0.1, max_batches=None):
         was_training = self.model.training
         self.model.eval()
 
         total_meter = 0.0
         reg_meter = 0.0
-        slot_meter = 0.0
-        feat_meter = 0.0
+        mvc_meter = 0.0
         count = 0
 
         for batch_idx, batch in enumerate(val_loader):
@@ -449,14 +375,12 @@ class LPLLM:
             total_loss, loss_dict = self.val_step(
                 batch,
                 lambda_reg=lambda_reg,
-                lambda_slot=lambda_slot,
-                lambda_feat=lambda_feat,
+                lambda_mvc=lambda_mvc,
             )
 
             total_meter += total_loss
             reg_meter += loss_dict["reg"]
-            slot_meter += loss_dict["slot"]
-            feat_meter += loss_dict["feat"]
+            mvc_meter += loss_dict["mvc"]
             count += 1
 
         if was_training:
@@ -466,15 +390,13 @@ class LPLLM:
             return {
                 "total": float("nan"),
                 "reg": float("nan"),
-                "slot": float("nan"),
-                "feat": float("nan"),
+                "mvc": float("nan"),
             }
 
         return {
             "total": total_meter / count,
             "reg": reg_meter / count,
-            "slot": slot_meter / count,
-            "feat": feat_meter / count,
+            "mvc": mvc_meter / count,
         }
 
     # -----------------------------------------------------
@@ -547,8 +469,7 @@ class LPLLM:
         lr=1e-5,
         weight_decay=1e-4,
         lambda_reg=1.0,
-        lambda_slot=0.1,
-        lambda_feat=1.0,
+        lambda_mvc=0.1,
         grad_clip=1.0,
         grad_accum_steps=1,         # 累積幾個 mini-batch 再 optimizer.step()
         log_every=10,
@@ -603,16 +524,14 @@ class LPLLM:
 
             running_total = 0.0
             running_reg = 0.0
-            running_slot = 0.0
-            running_feat = 0.0
+            running_mvc = 0.0
             running_count = 0
 
             for batch_idx, batch in enumerate(train_loader, start=1):
                 total_loss, loss_dict = self.train_step(
                     batch,
                     lambda_reg=lambda_reg,
-                    lambda_slot=lambda_slot,
-                    lambda_feat=lambda_feat,
+                    lambda_mvc=lambda_mvc,
                 )
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -655,8 +574,7 @@ class LPLLM:
                 # 累積 mini-batch 的 loss（用原始值，未除以 accum steps）
                 running_total += loss_dict["total"]
                 running_reg += loss_dict["reg"]
-                running_slot += loss_dict["slot"]
-                running_feat += loss_dict["feat"]
+                running_mvc += loss_dict["mvc"]
                 running_count += 1
 
                 # ---- 判斷是否到達 optimizer.step() 時機 ----
@@ -698,15 +616,13 @@ class LPLLM:
                 if global_step % log_every == 0:
                     avg_total = running_total / running_count
                     avg_reg = running_reg / running_count
-                    avg_slot = running_slot / running_count
-                    avg_feat = running_feat / running_count
+                    avg_mvc = running_mvc / running_count
 
                     print(
                         f"[train] step={global_step} "
                         f"total={avg_total:.4f} "
                         f"reg={lambda_reg * avg_reg:.4f} "
-                        f"slot={lambda_slot * avg_slot:.4f} "
-                        f"feat={lambda_feat * avg_feat:.4f}"
+                        f"mvc={lambda_mvc * avg_mvc:.4f}"
                     )
 
                     history.append({
@@ -715,16 +631,14 @@ class LPLLM:
                         "split": "train",
                         "total": avg_total,
                         "reg": avg_reg,
-                        "slot": avg_slot,
-                        "feat": avg_feat,
+                        "mvc": avg_mvc,
                     })
                     with open(history_path, "w", encoding="utf-8") as _hf:
                         json.dump(history, _hf, indent=2, ensure_ascii=False)
 
                     running_total = 0.0
                     running_reg = 0.0
-                    running_slot = 0.0
-                    running_feat = 0.0
+                    running_mvc = 0.0
                     running_count = 0
 
                 # -------------------------------
@@ -734,8 +648,7 @@ class LPLLM:
                     val_metrics = self.validate(
                         val_loader,
                         lambda_reg=lambda_reg,
-                        lambda_slot=lambda_slot,
-                        lambda_feat=lambda_feat,
+                        lambda_mvc=lambda_mvc,
                         max_batches=max_val_batches,
                     )
 
@@ -743,8 +656,7 @@ class LPLLM:
                         f"[val]   step={global_step} "
                         f"total={val_metrics['total']:.4f} "
                         f"reg={lambda_reg * val_metrics['reg']:.4f} "
-                        f"slot={lambda_slot * val_metrics['slot']:.4f} "
-                        f"feat={lambda_feat * val_metrics['feat']:.4f}"
+                        f"mvc={lambda_mvc * val_metrics['mvc']:.4f}"
                     )
 
                     history.append({
@@ -834,8 +746,7 @@ class LPLLM:
             val_metrics = self.validate(
                 val_loader,
                 lambda_reg=lambda_reg,
-                lambda_slot=lambda_slot,
-                lambda_feat=lambda_feat,
+                lambda_mvc=lambda_mvc,
                 max_batches=max_val_batches,
             )
 
@@ -843,8 +754,7 @@ class LPLLM:
                 f"[epoch-end val] epoch={epoch} "
                 f"total={val_metrics['total']:.4f} "
                 f"reg={val_metrics['reg']:.4f} "
-                f"slot={val_metrics['slot']:.4f} "
-                f"feat={val_metrics['feat']:.4f}"
+                f"mvc={val_metrics['mvc']:.4f}"
             )
 
             history.append({

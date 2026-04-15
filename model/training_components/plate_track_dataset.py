@@ -83,7 +83,6 @@ class TrackCollator:
 
     def __call__(self, batch):
         flat_lr_images = []
-        flat_hr_images = []
         flat_full_texts = []
         flat_prompt_texts = []
 
@@ -95,7 +94,7 @@ class TrackCollator:
             plate_id = sample["plate_id"]
             label = sample["text_label"]
             lr_imgs = sample["lr_images"]
-            hr_imgs = sample["hr_images"]
+            hr_imgs = sample.get("hr_images", [])
 
             prompt_text, full_text = self._build_prompt_and_full_text(label)
 
@@ -107,9 +106,6 @@ class TrackCollator:
                 flat_lr_images.append(lr_img)
                 flat_full_texts.append(full_text)
                 flat_prompt_texts.append(prompt_text)
-
-            for hr_img in hr_imgs:
-                flat_hr_images.append(hr_img)
 
         reg_inputs = self.processor(
             text=flat_full_texts,
@@ -140,7 +136,7 @@ class TrackCollator:
         return {
             "reg_inputs": reg_inputs,
             "lr_images_flat": flat_lr_images,
-            "hr_images_flat": flat_hr_images,
+            "hr_images_flat": [],
             "plate_ids": plate_ids,
             "text_labels": labels,
             "num_views": num_views,
@@ -181,8 +177,6 @@ class UFPRPlateTrackDataset(Dataset):
             idx = f"{i:03d}"
             if not (plate_dir / f"lr-{idx}.png").exists():
                 return False
-            if not (plate_dir / f"hr-{idx}.png").exists():
-                return False
         return True
 
     def _load_label(self, json_path):
@@ -203,22 +197,17 @@ class UFPRPlateTrackDataset(Dataset):
         label = self._load_label(plate_dir / "hr-001.json")
 
         lr_imgs = []
-        hr_imgs = []
-
         for i in range(1, self.num_frames + 1):
             frame_idx = f"{i:03d}"
             lr_path = plate_dir / f"lr-{frame_idx}.png"
-            hr_path = plate_dir / f"hr-{frame_idx}.png"
 
             lr_img = Image.open(lr_path).convert("RGB")
-            hr_img = Image.open(hr_path).convert("RGB")
 
             lr_imgs.append(lr_img)
-            hr_imgs.append(hr_img)
 
         return {
             "plate_id": f"{plate_dir.parent.name}/{plate_dir.name}",
             "text_label": label,
             "lr_images": lr_imgs,   # list[PIL], len=5
-            "hr_images": hr_imgs,   # list[PIL], len=5
+            "hr_images": [],        # MVC 版本不需要 HR 圖
         }

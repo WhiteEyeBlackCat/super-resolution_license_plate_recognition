@@ -50,8 +50,7 @@ for config in EXPERIMENTS:
         save_dir=exp_dir,
         name=config["name"],
         reg_weight=config["lambda_reg"],
-        lambda_slot=config["lambda_slot"],
-        lambda_feat=config["lambda_feat"],
+        lambda_mvc=config["lambda_mvc"],
     )
 
     summary = summarize_history(history, config=config, dataset_summary=dataset_summary)
